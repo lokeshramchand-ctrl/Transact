@@ -1,7 +1,6 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
-import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 
 void main() {
@@ -39,7 +38,7 @@ class _IngestionScreenState extends State<IngestionScreen> {
   final Dio _dio = Dio();
 
   // Connects to local FastAPI instance
-  final String _baseUrl = "http://192.168.1.44:8000";
+  final String _baseUrl = "http://10.0.2.2:8080";
   final String _apiKey = "velar_test_key_123";
 
   bool _isProcessing = false;
@@ -50,12 +49,16 @@ class _IngestionScreenState extends State<IngestionScreen> {
   Future<void> _pickAndProcessPDF() async {
     try {
       // 1. Open the native file picker
-      FilePickerResult? result = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['pdf'],
+      const XTypeGroup pdfTypeGroup = XTypeGroup(
+        label: 'PDFs',
+        extensions: <String>['pdf'],
       );
 
-      if (result != null && result.files.single.path != null) {
+      final XFile? result = await openFile(
+        acceptedTypeGroups: <XTypeGroup>[pdfTypeGroup],
+      );
+
+      if (result != null) {
         setState(() {
           _isProcessing = true;
           _statusText = "Extracting text locally from PDF...";
@@ -63,33 +66,134 @@ class _IngestionScreenState extends State<IngestionScreen> {
         });
 
         // 2. Read and Extract PDF Text securely on the device
-        File file = File(result.files.single.path!);
-        final bytes = await file.readAsBytes();
+        final bytes = await result.readAsBytes();
         final PdfDocument document = PdfDocument(inputBytes: bytes);
         final String text = PdfTextExtractor(document).extractText();
         document.dispose();
 
-        // 3. Filter for likely transaction lines (Simple Heuristic Regex)
-        List<String> lines = text.split('\n');
+        // 3. Ultimate GPay Smart Parser
         List<String> potentialTransactions = [];
-        final txRegex = RegExp(
-          r'(UPI|Paid to|Sent to|IMPS|NEFT)',
-          caseSensitive: false,
-        );
 
-        for (String line in lines) {
-          if (line.trim().length > 10 && txRegex.hasMatch(line)) {
-            potentialTransactions.add(line.trim());
+        // --- STRATEGY 1: CSV / Columnar Format ---
+        // Syncfusion sometimes outputs tables as "Col1","Col2","Col3"
+        final csvRowRegex = RegExp(
+          r'"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"',
+        );
+        final csvMatches = csvRowRegex.allMatches(text);
+
+        if (csvMatches.isNotEmpty) {
+          final merchantRegex = RegExp(r'(Paid to|Received from)\s+([^\r\n]+)');
+          final amountRegex = RegExp(
+            r'(?:₹\s*)?([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)',
+          );
+
+          for (var row in csvMatches) {
+            String col2 = row.group(2) ?? '';
+            String col3 = row.group(3) ?? '';
+
+            var merchants = merchantRegex.allMatches(col2).toList();
+            var amounts = amountRegex.allMatches(col3).toList();
+
+            // Pair the arrays together
+            int count = merchants.length < amounts.length
+                ? merchants.length
+                : amounts.length;
+            for (int i = 0; i < count; i++) {
+              String type = merchants[i].group(1)!.trim();
+              String name = merchants[i].group(2)!.trim();
+              String amt = amounts[i].group(1)!.replaceAll(',', '');
+              String rawTx = "$type $name ₹$amt";
+              if (!potentialTransactions.contains(rawTx)) {
+                potentialTransactions.add(rawTx);
+              }
+            }
           }
         }
 
-        // We limit to 10 for testing so we don't trigger your SlowAPI rate limits!
-        final testBatch = potentialTransactions.take(10).toList();
+        // --- STRATEGY 2: Flexible Line-by-Line with Stateful Lookahead ---
+        // If Strategy 1 missed things (or wasn't CSV formatted), fallback to this robust crawler
+        if (potentialTransactions.isEmpty) {
+          List<String> lines = text.split(RegExp(r'\r?\n'));
+          Set<int> consumedAmountLines =
+              {}; // Tracks amounts we've already paired to prevent double-counting
+
+          for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+
+            // Match "Paid to" or "Received from" and stop before UPI or ₹
+            final merchantMatch = RegExp(
+              r'(Paid to|Received from)\s+(.*?)(?=₹|UPI|Paid|$)',
+            ).firstMatch(line);
+
+            if (merchantMatch != null) {
+              String type = merchantMatch.group(1)!.trim();
+              String merchant = merchantMatch.group(2)!.trim();
+              // Fixed the regex syntax here by using a standard string instead of a raw string
+              merchant = merchant
+                  .replaceAll(RegExp('["\',]'), '')
+                  .trim(); // Sanitize
+
+              String amount = "";
+
+              // A. Check if amount is sitting directly on the same line
+              final sameLineAmountMatch = RegExp(
+                r'₹\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)',
+              ).firstMatch(line);
+              if (sameLineAmountMatch != null) {
+                amount = sameLineAmountMatch.group(1)!;
+              } else {
+                // B. Look ahead up to 20 lines (to jump over grouped columns)
+                for (int j = 1; j <= 20; j++) {
+                  int targetIdx = i + j;
+                  if (targetIdx < lines.length &&
+                      !consumedAmountLines.contains(targetIdx)) {
+                    String lookAhead = lines[targetIdx].trim();
+
+                    // Check for standard format with ₹
+                    final aheadAmountMatch = RegExp(
+                      r'₹\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)',
+                    ).firstMatch(lookAhead);
+                    if (aheadAmountMatch != null) {
+                      amount = aheadAmountMatch.group(1)!;
+                      consumedAmountLines.add(targetIdx);
+                      break;
+                    }
+
+                    // Fallback for amounts missing the ₹ symbol (e.g. "246.43")
+                    if (RegExp(
+                      r'^([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)$',
+                    ).hasMatch(lookAhead)) {
+                      // Ensure it's not a bank ID suffix like "5488" or a date chunk
+                      if (lookAhead != "5488" &&
+                          lookAhead.length < 8 &&
+                          !lookAhead.startsWith('202')) {
+                        amount = lookAhead;
+                        consumedAmountLines.add(targetIdx);
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+
+              if (amount.isNotEmpty) {
+                String rawTx = "$type $merchant ₹${amount.replaceAll(',', '')}"
+                    .trim();
+                if (!potentialTransactions.contains(rawTx)) {
+                  potentialTransactions.add(rawTx);
+                }
+              }
+            }
+          }
+        }
+
+        // We limit to 20 for testing so we don't trigger your SlowAPI rate limits!
+        final testBatch = potentialTransactions.take(20).toList();
 
         if (testBatch.isEmpty) {
           setState(() {
             _statusText =
-                "No recognizable UPI/Bank transactions found in this PDF.";
+                "No recognizable GPay transactions found in this PDF.\nEnsure it's a standard Google Pay statement.";
             _isProcessing = false;
           });
           return;
