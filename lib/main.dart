@@ -1,7 +1,6 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
-import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 
 void main() {
@@ -36,69 +35,191 @@ class IngestionScreen extends StatefulWidget {
 }
 
 class _IngestionScreenState extends State<IngestionScreen> {
-  final Dio _dio = Dio();
+  // Added 5-second timeouts so the app never hangs indefinitely!
+  final Dio _dio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 5),
+      receiveTimeout: const Duration(seconds: 10),
+    ),
+  );
 
   // Connects to local FastAPI instance
-  final String _baseUrl = "http://192.168.1.44:8000";
+  final String _baseUrl = "http://10.0.2.2:8080";
   final String _apiKey = "velar_test_key_123";
 
   bool _isProcessing = false;
+  double _progressValue = 0.0;
   String _statusText =
       "Upload a Bank/UPI PDF statement to extract and categorize transactions.";
   final List<Map<String, dynamic>> _transactions = [];
 
+  // Stores step-by-step parsing details for debugging
+  final List<String> _debugLogs = [];
+
+  void _showDebugLogs() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text(
+          "Extraction Logs",
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: _debugLogs.length,
+            itemBuilder: (context, index) => Padding(
+              padding: const EdgeInsets.only(bottom: 6.0),
+              child: Text(
+                _debugLogs[index],
+                style: TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                  color: _debugLogs[index].startsWith('✅')
+                      ? Colors.green.shade700
+                      : _debugLogs[index].startsWith('⚠️')
+                      ? Colors.orange.shade700
+                      : _debugLogs[index].startsWith('❌')
+                      ? Colors.red.shade700
+                      : Colors.black87,
+                ),
+              ),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Close"),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _pickAndProcessPDF() async {
     try {
-      // 1. Open the native file picker
-      FilePickerResult? result = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['pdf'],
+      const XTypeGroup pdfTypeGroup = XTypeGroup(
+        label: 'PDFs',
+        extensions: <String>['pdf'],
       );
 
-      if (result != null && result.files.single.path != null) {
+      final XFile? result = await openFile(
+        acceptedTypeGroups: <XTypeGroup>[pdfTypeGroup],
+      );
+
+      if (result != null) {
         setState(() {
           _isProcessing = true;
+          _progressValue = 0.0;
           _statusText = "Extracting text locally from PDF...";
           _transactions.clear();
+          _debugLogs.clear();
         });
 
-        // 2. Read and Extract PDF Text securely on the device
-        File file = File(result.files.single.path!);
-        final bytes = await file.readAsBytes();
+        _debugLogs.add("--- STARTING VISUAL COORDINATE EXTRACTION ---");
+
+        final bytes = await result.readAsBytes();
         final PdfDocument document = PdfDocument(inputBytes: bytes);
-        final String text = PdfTextExtractor(document).extractText();
-        document.dispose();
+        final PdfTextExtractor extractor = PdfTextExtractor(document);
 
-        // 3. Filter for likely transaction lines (Simple Heuristic Regex)
-        List<String> lines = text.split('\n');
         List<String> potentialTransactions = [];
-        final txRegex = RegExp(
-          r'(UPI|Paid to|Sent to|IMPS|NEFT)',
-          caseSensitive: false,
-        );
 
-        for (String line in lines) {
-          if (line.trim().length > 10 && txRegex.hasMatch(line)) {
-            potentialTransactions.add(line.trim());
+        // Process page by page
+        for (int pageIndex = 0; pageIndex < document.pages.count; pageIndex++) {
+          // 1. Extract raw lines WITH their X and Y bounding coordinates
+          List<TextLine> textLines = extractor.extractTextLines(
+            startPageIndex: pageIndex,
+            endPageIndex: pageIndex,
+          );
+          List<List<TextLine>> rows = [];
+
+          // 2. Group chunks by Y-Coordinate (tolerance of 5.0 points for slight vertical misalignments)
+          for (var tl in textLines) {
+            bool added = false;
+            for (var row in rows) {
+              if ((row.first.bounds.top - tl.bounds.top).abs() < 5.0) {
+                row.add(tl);
+                added = true;
+                break;
+              }
+            }
+            if (!added) {
+              rows.add([tl]);
+            }
           }
+
+          // 3. Sort rows top-to-bottom
+          rows.sort((a, b) => a.first.bounds.top.compareTo(b.first.bounds.top));
+
+          int pageMatches = 0;
+
+          // 4. Sort each chunk left-to-right to reconstruct the visual sentence
+          for (var row in rows) {
+            row.sort((a, b) => a.bounds.left.compareTo(b.bounds.left));
+
+            // Stitch the line together
+            String fullLine = row.map((e) => e.text.trim()).join(' ').trim();
+
+            if (fullLine.isEmpty || fullLine.startsWith('Page ')) continue;
+
+            // 5. Strict Regex: Match type, merchant, and the amount strictly at the END of the visual line
+            final match = RegExp(
+              r'(Paid to|Received from|Sent to)\s+(.+?)\s+(?:₹|Rs\.?)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d{1,2})?)$',
+              caseSensitive: false,
+            ).firstMatch(fullLine);
+
+            if (match != null) {
+              String type = match.group(1)!.trim();
+              String merchant = match.group(2)!.trim();
+              String amount = match
+                  .group(3)!
+                  .replaceAll(',', ''); // Strip commas for backend
+
+              String rawTx = "$type $merchant ₹$amount";
+              if (!potentialTransactions.contains(rawTx)) {
+                potentialTransactions.add(rawTx);
+                pageMatches++;
+                _debugLogs.add("✅ Extracted: $rawTx");
+              }
+            } else if (fullLine.toLowerCase().contains("paid to") ||
+                fullLine.toLowerCase().contains("received from")) {
+              // Log near-misses (e.g. lines that have 'Paid to' but the amount got pushed to the next line)
+              _debugLogs.add("⚠️ Near Miss: $fullLine");
+            }
+          }
+
+          _debugLogs.add(
+            "Page ${pageIndex + 1}: Reconstructed ${rows.length} rows, found $pageMatches transactions.",
+          );
         }
 
-        // We limit to 10 for testing so we don't trigger your SlowAPI rate limits!
-        final testBatch = potentialTransactions.take(10).toList();
+        document.dispose();
+
+        _debugLogs.add(
+          "\n--- TOTAL UNIQUE TRANSACTIONS FOUND: ${potentialTransactions.length} ---",
+        );
+
+        // We process EVERYTHING now! No more limit.
+        final testBatch = potentialTransactions;
 
         if (testBatch.isEmpty) {
           setState(() {
             _statusText =
-                "No recognizable UPI/Bank transactions found in this PDF.";
+                "No recognizable GPay transactions found in this PDF.\nCheck the 'Bug' icon to see extraction logs.";
             _isProcessing = false;
           });
           return;
         }
 
-        // 4. Stream each transaction to the Velar Intelligence Engine
+        // Stream each transaction to the Velar Intelligence Engine
         for (int i = 0; i < testBatch.length; i++) {
           final txText = testBatch[i];
+
+          // Update the UI Progress Bar
           setState(() {
+            _progressValue = (i + 1) / testBatch.length;
             _statusText =
                 "Categorizing ${i + 1}/${testBatch.length}...\nProcessing: $txText";
           });
@@ -125,12 +246,21 @@ class _IngestionScreenState extends State<IngestionScreen> {
                 });
               });
             }
+          } on DioException catch (e) {
+            if (e.response?.statusCode == 429) {
+              _debugLogs.add(
+                "⚠️ Rate Limit Hit (429) for '$txText'. Backend blocked request.",
+              );
+            } else {
+              _debugLogs.add("❌ Network/API Error for '$txText': ${e.message}");
+            }
           } catch (e) {
-            debugPrint("API Error for '$txText': $e");
+            _debugLogs.add("❌ Unknown Error for '$txText': $e");
           }
 
-          // Small 300ms delay to prevent hammering the FastAPI server
-          await Future.delayed(const Duration(milliseconds: 300));
+          // 600ms delay perfectly aligns with 100 requests per minute!
+          // This prevents SlowAPI from blocking the later transactions.
+          await Future.delayed(const Duration(milliseconds: 600));
         }
 
         setState(() {
@@ -142,6 +272,7 @@ class _IngestionScreenState extends State<IngestionScreen> {
       setState(() {
         _statusText = "❌ Error processing PDF: $e";
       });
+      _debugLogs.add("EXCEPTION CAUGHT: $e");
     } finally {
       setState(() {
         _isProcessing = false;
@@ -173,28 +304,50 @@ class _IngestionScreenState extends State<IngestionScreen> {
                     fontWeight: FontWeight.w500,
                   ),
                 ),
-                const SizedBox(height: 24),
-                SizedBox(
-                  height: 50,
-                  width: double.infinity,
-                  child: FilledButton.icon(
-                    onPressed: _isProcessing ? null : _pickAndProcessPDF,
-                    icon: _isProcessing
-                        ? const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(
-                              color: Colors.white,
-                              strokeWidth: 2,
-                            ),
-                          )
-                        : const Icon(Icons.upload_file_rounded),
-                    label: Text(
-                      _isProcessing
-                          ? 'Processing PDF...'
-                          : 'Upload Google Pay Statement',
-                    ),
+                if (_isProcessing) ...[
+                  const SizedBox(height: 16),
+                  LinearProgressIndicator(
+                    value: _progressValue > 0 ? _progressValue : null,
+                    borderRadius: BorderRadius.circular(4),
                   ),
+                ],
+                const SizedBox(height: 24),
+                Row(
+                  children: [
+                    Expanded(
+                      child: SizedBox(
+                        height: 50,
+                        child: FilledButton.icon(
+                          onPressed: _isProcessing ? null : _pickAndProcessPDF,
+                          icon: _isProcessing
+                              ? const SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(
+                                    color: Colors.white,
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.upload_file_rounded),
+                          label: Text(
+                            _isProcessing
+                                ? 'Processing PDF...'
+                                : 'Upload Google Pay Statement',
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    // Debug Logs Button
+                    SizedBox(
+                      height: 50,
+                      child: IconButton.filledTonal(
+                        onPressed: _debugLogs.isEmpty ? null : _showDebugLogs,
+                        icon: const Icon(Icons.bug_report_rounded),
+                        tooltip: 'View Extraction Logs',
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -203,7 +356,7 @@ class _IngestionScreenState extends State<IngestionScreen> {
 
           // Transaction Results List
           Expanded(
-            child: _transactions.isEmpty
+            child: _transactions.isEmpty && !_isProcessing
                 ? Center(
                     child: Icon(
                       Icons.receipt_long_rounded,
@@ -215,7 +368,9 @@ class _IngestionScreenState extends State<IngestionScreen> {
                     padding: const EdgeInsets.all(12),
                     itemCount: _transactions.length,
                     itemBuilder: (context, index) {
-                      final tx = _transactions[index];
+                      // Reverse the list so newest transactions appear at the top
+                      final tx =
+                          _transactions[_transactions.length - 1 - index];
                       final isHighConfidence = tx['confidence'] >= 0.8;
 
                       return Card(
